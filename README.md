@@ -84,3 +84,27 @@ with one category count per dimension (`0` or `1` means real-valued). Its result
 The Python objective is called once per evaluation; exceptions raised by it
 are propagated to the caller.
 
+### Real-data MLP example
+
+[`examples/breast_cancer_mlp.py`](examples/breast_cancer_mlp.py) uses the
+Wisconsin Diagnostic Breast Cancer dataset bundled with scikit-learn. It
+jointly tunes all 97 parameters of a small MLP using AHCO, in three separate
+scalar-objective runs: binary cross-entropy, Brier score, and ROC-AUC. Each
+objective uses the training partition only; the held-out test partition is
+reported afterward and does not guide optimization. The feature scaler is
+also fit only on training data.
+
+From the repository root, install the Python extension and example
+dependencies, then run:
+
+```powershell
+python -m pip install -e .
+python -m pip install numpy scikit-learn
+python examples\breast_cancer_mlp.py
+```
+
+Pass `--budget` to change the number of objective calls per run and `--seed`
+to change the AHCO seed sequence. AHCO optimizes the network weights directly
+as a bounded, derivative-free search; this compact example demonstrates the
+API and is not a replacement for gradient-based MLP training or a clinical
+model.
