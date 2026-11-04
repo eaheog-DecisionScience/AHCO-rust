@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ahco-rust"
+version = "0.1.1"
+description = "Rust implementation of AHCO-v4 mixed continuous and categorical optimization"
+requires-python = ">=3.8"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+
+[tool.maturin]
+features = ["python"]
+python-source = "."
+module-name = "ahco_rust.ahco"

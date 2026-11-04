@@ -1,0 +1,25 @@
+[package]
+name = "ahco"
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.82"
+description = "AHCO-v4 mixed continuous and categorical black-box optimization with constraints"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ahco"
+keywords = ["optimization", "black-box", "continuous", "python"]
+categories = ["science"]
+
+[lib]
+name = "ahco"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[dependencies]
+rand = "0.8.5"
+rand_chacha = "0.3.1"
+rand_distr = "0.4.3"
+pyo3 = { version = "0.23.5", optional = true, features = ["extension-module"] }
