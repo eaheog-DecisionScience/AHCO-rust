@@ -60,6 +60,8 @@ Broader frameworks may suit users who need many algorithms, integer or log-scale
 
 To evaluate AHCO in its intended high-dimensional, low-budget setting, we ran four deterministic, bounded maximization problems at dimension $d=97$ with a budget of $B=40$ objective calls per run ($B<d$). The suite includes dense Sphere (97 active coordinates), sparse Sphere (10 active coordinates), an ill-conditioned Ellipsoid (97 active coordinates), and Rosenbrock (97 active coordinates). Each analytic objective has known optimum score 0; higher scores are better. The formulations and fixed active-coordinate indices are in [`benchmarks/run_benchmarks.py`](./benchmarks/run_benchmarks.py).
 
+These benchmark results describe the earlier AHCO-v4 policy; they are not an evaluation of the proxy-star research policy described below. The research policy needs its own repeated-seed benchmark and ablation before performance claims can be made.
+
 We also ran a 97-parameter, $10\to8\to1$ tanh MLP weight-search task on scikit-learn's diabetes dataset (442 rows, 10 features). For this task only, the 97 decision variables are all network weights and biases, decoded from $[0,1]$ to $[-3,3]$. A fixed shuffled 75/25 split (random state 2025) was used; feature and target scalers were fit on the training partition only. Optimizers maximized negative training MSE. Test MSE was computed once for the best training-score point and was never used to select proposals. Test MSE is in training-standardized target units.
 
 Each method received the same 40 sequential calls on each of 20 seeds (0--19): AHCO-v4 (`kmax=14`, batch size 1), uniform random search, Optuna TPE (10 startup trials), and Nevergrad OnePlusOne (mutation sigma 0.25). The latter settings were fixed rather than tuned per task. The reported entries are medians over seeds with 95% percentile-bootstrap confidence intervals for the median (10,000 resamples). For the analytic tasks the metric is best objective score; for diabetes the table gives both best training score and held-out MSE. Parentheses are the bootstrap confidence intervals. The run used Windows 10, Python 3.11.0, Rust 1.89.0, AHCO 0.1.1, NumPy 1.26.4, SciPy 1.14.1, scikit-learn 1.6.0, Optuna 5.0.0, and Nevergrad 1.0.12.
@@ -83,72 +85,68 @@ The diabetes task is one small fixed-split real-data demonstration, not broad ev
 
 ## Overview
 
-A run proceeds in four stages:
+A run proceeds from a small bootstrap into an evidence-driven sequential loop:
 
-1. **Grouped screening design**: a small set of points where random groups of coordinates move together.
-2. **Active-coordinate selection**: rank coordinates by evidence of influence and keep the top $m$.
-3. **Integration design**: a Latin hypercube over the active coordinates, other coordinates fixed at the best screening point.
-4. **Adaptive loop**: fit the surrogate, propose a batch of $q$ points (default $q=1$) with bandit-selected strategies, evaluate, update the bandit and trust region; re-select active coordinates and blocks at 55% and 80% of the budget.
+1. **Grouped bootstrap**: up to six points where randomized groups of real coordinates move together.
+2. **Evidence-driven loop**: rank coordinates by observed influence, infer and prune signed pair hypotheses, derive proxy-star hypotheses from two-edge paths, then let a bandit select among available proposal strategies for each next evaluation. Refresh active coordinates when an evaluation improves the best score or a trust-region restart occurs.
 
-The design choices are: one internal representation (the unit cube, with categorical values snapped to cell centres); rank-transformed scores for robustness to scale and outliers; randomized trees because they handle one-hot columns and need little tuning while giving a disagreement signal; a bandit over strategies so that local, interaction and global moves are used according to recent success; and a trust region for local focus with restarts.
+The total evaluation budget remains a hard cap, but there is no fixed exploration/integration allocation or budget-percentage refresh schedule. The bootstrap only supplies initial observations; all later evaluations are selected sequentially from the evidence available so far. Hypothesis confidence is a heuristic consistency score, not a calibrated probability or proof of a global optimum.
 
 ## Scores, constraints and categorical coordinates
 
 Let $f$ be the objective and $B$ the budget. A run makes exactly $B$ objective calls. A non-finite value becomes $-10^{100}$ (assuming ordinary scores exceed it), a NaN violation becomes a large finite violation, and an objective error stops the run. Proposals lie in $[0,1]^d$.
 
-A categorical coordinate with $r$ levels is snapped to the cell centre $(k+1/2)/r$. Grouped screening draws categorical levels uniformly and snaps all designs; every proposal is snapped before use.
+A categorical coordinate with $r$ levels is snapped to the cell centre $(k+1/2)/r$. Grouped bootstrap draws categorical levels uniformly and snaps all designs; every proposal is snapped before use.
 
 A constraint reports a violation $v(x)$, with $v(x)\leq0$ feasible. Two sources are supported and may be combined:
 
-- A **known constraint** is a cheap function of $x$. It never consumes budget: initial designs make up to 40 draws per point to find a feasible one, Latin-hypercube points are repaired by up to 30 resamples of the active coordinates, and every candidate pool is filtered to feasible candidates (or, if none is feasible, the least-violating ones). The inactive-coordinate strategy retries up to ten times and may still return an infeasible point. Known violations are used only for filtering and are not stored with observations.
+- A **known constraint** is a cheap function of $x$. It never consumes objective budget: bootstrap designs make up to 40 draws per point to find a feasible one, and every candidate pool is filtered to feasible candidates (or, if none is feasible, the least-violating ones). The inactive-coordinate strategy retries up to ten times and may still return an infeasible point. Known violations are used only for filtering and are not stored with observations.
 - An **objective-reported violation** is returned with the value (`Evaluation`) and stored with the observation. It affects ranking after the fact.
 
 Ranking uses an effective score. With `FeasibilityFirst`, all feasible observations rank above infeasible ones, and infeasible ones are ordered by violation. With `Penalty { weight }` (the default, weight 5), the effective score is $f(x)-\mathrm{weight}\cdot\max(v(x),0)$; the weight is scale-dependent and should be set for the objective at hand. The returned point is the best by effective score. The `feasible` flag says whether it is feasible, and the history records the best feasible value (the sentinel $-10^{100}$ until one is found).
 
 ## Initial design and screening
 
-For each screening point AHCO draws a group count $g=\mathrm{clip}(\mathrm{round}(d^{U}),1,d)$ with $U\sim\mathrm{Uniform}[0.4,0.9)$, draws one centre per group uniformly on $[0.05,0.95]$, assigns each real coordinate to a random group, adds $\mathcal N(0,0.04^2)$ noise and clips to $[0,1]$. Categorical coordinates are drawn independently and uniformly instead, since grouping unordered levels has no meaning.
+For each bootstrap point AHCO draws a group count $g=\mathrm{clip}(\mathrm{round}(d^{U}),1,d)$ with $U\sim\mathrm{Uniform}[0.4,0.9)$, draws one centre per group uniformly on $[0.05,0.95]$, assigns each real coordinate to a random group, adds $\mathcal N(0,0.04^2)$ noise and clips to $[0,1]$. Categorical coordinates are drawn independently and uniformly instead, since grouping unordered levels has no meaning. The bootstrap size is $\min(B,6)$; it does not reserve a separate integration budget.
 
 Scores are converted to ranks in $[-1,1]$ (ties follow observation order). For a real coordinate with $z_j=2x_j-1$, the effect score is the larger of the absolute correlations of $z_j$ and of $z_j^2-1/3$ with the ranks. For a categorical coordinate it is $\eta=\sqrt{SS_{\mathrm{between}}/SS_{\mathrm{total}}}$ over the rank scores grouped by level. The coordinate score adds (a) the fraction of 24 random half-samples in which the *linear* correlation magnitude (or $\eta$ for categoricals) is at least $0.22$, and (b) normalized split-gain importance from a 35-tree forest on the encoded data, summed over one-hot columns per coordinate. Active coordinates from an earlier selection get a factor $1.15$ at re-selection. The active set has size $m=\min(d,\max(k_{\max},\min(d,3)))$ with $k_{\max}=14$ by default. This heuristic is not an error-controlled stability-selection procedure.
 
-For coordinates left inactive, AHCO also records a guess at a good value: for a real coordinate, the peak of a quadratic regression of the ranks on $z_j$ and $z_j^2-1/3$; for a categorical coordinate, the level with the highest mean rank.
+For coordinates left inactive, AHCO also records a guess at a good value: for a real coordinate, the peak of a quadratic regression of the ranks on $z_j$ and $z_j^2-1/3$; for a categorical coordinate, the level with the highest mean rank. The active set is re-estimated after a best-score improvement and at a trust-region restart, retaining a mild preference for previously active coordinates.
 
 ## Interaction blocks
 
-Among the real active coordinates, AHCO correlates each product $z_jz_k$ with the ranks. Pairs with absolute correlation at least $0.20$ are joined, and connected components become blocks. Blocks require at least two active coordinates and 12 observations; otherwise every active coordinate is its own block. Each categorical active coordinate is its own block, so interactions involving categorical coordinates are not detected. These blocks describe associations in the observed design, not causal or functional dependence.
+For each real active pair, AHCO correlates $z_jz_k$ with the rank scores. A pair is retained when the absolute correlation is at least $0.15$ and its sign agrees in at least 70% of 24 random half-samples. Its heuristic confidence is sign stability multiplied by $\min(|r|/0.4,1)$. Two retained relationships sharing a mediator create a proxy-star hypothesis between their other endpoints; its direction is the product of the two signs and its confidence is the product of their confidences. Proxy hypotheses below confidence $0.20$ are pruned, and the strongest hypothesis is retained for each endpoint pair. Connected components of retained direct and proxy hypotheses form proposal blocks. Categorical active coordinates are singleton blocks; categorical interactions are not inferred. These are associations in the observed design, not causal or functional dependence, and the chained direction does not imply equal magnitudes or equal mediator influence.
 
 ## Surrogate and acquisition
 
-The surrogate is an ensemble of 45 randomized regression trees fitted to all observations, using the active coordinates (categoricals one-hot encoded) and the rank scores. Each split considers $\lceil\sqrt{c}\rceil$ random columns, where $c$ is the number of encoded columns, samples six uniform thresholds per column within the observed range, and keeps the split with the largest squared-error reduction provided both children have at least two observations. Nodes are leaves with fewer than five observations, at depth eight, or without a positive-gain split. This relates to randomized tree ensembles [@Geurts2006] without claiming equivalence to any named implementation. The surrogate is refitted about every two evaluations (every round when $q>1$) and after re-selection.
+The surrogate is an ensemble of 45 randomized regression trees fitted to all observations, using the active coordinates (categoricals one-hot encoded) and the rank scores. Each split considers $\lceil\sqrt{c}\rceil$ random columns, where $c$ is the number of encoded columns, samples six uniform thresholds per column within the observed range, and keeps the split with the largest squared-error reduction provided both children have at least two observations. Nodes are leaves with fewer than five observations, at depth eight, or without a positive-gain split. This relates to randomized tree ensembles [@Geurts2006] without claiming equivalence to any named implementation. The surrogate is refitted about every two evaluations and whenever the active set changes.
 
-With $T_t(x)$ the prediction of tree $t$, AHCO computes the mean $\hat\mu(x)$ and population standard deviation $\hat\sigma(x)$ across the 45 trees, and ranks candidates by
-$$\hat\mu(x)+\beta\,\hat\sigma(x),\qquad \beta=1.4\,(1-n/B)^{1.2}+0.15,$$
-where $n$ is the number of evaluations so far. This is an exploration heuristic based on tree disagreement, not a posterior standard deviation or confidence bound.
+With $T_t(x)$ the prediction of tree $t$, AHCO computes the mean $\hat\mu(x)$ and population standard deviation $\hat\sigma(x)$ across the 45 trees, and ranks candidates by $\hat\mu(x)+1.4\hat\sigma(x)$. This is an exploration heuristic based on tree disagreement, not a posterior standard deviation or confidence bound; its coefficient is not scheduled by elapsed budget.
 
 ## Proposal strategies
 
-Let $\mathrm{TR}$ be the trust-region width, $x_c$ the centre (the best point unless a restart has chosen another), and $x^*$ the best observed point. Every candidate is snapped and constraint-filtered before scoring. The four strategies are:
+Let $\mathrm{TR}$ be the trust-region width, $x_c$ the centre (the best point unless a restart has chosen another), and $x^*$ the best observed point. Every candidate is snapped and constraint-filtered before scoring. The five strategies are:
 
-1. **UCB.** 400 perturbations of $x_c$ (each active coordinate changed with probability $\mathrm{clip}(4/m,0.25,1)$, at least one forced; real coordinates drawn uniformly in $[x_c-\mathrm{TR}/2,x_c+\mathrm{TR}/2]$ clipped to $[0,1]$, categorical coordinates redrawn uniformly), 200 mutations of the three best observations (Gaussian noise with standard deviation $\max(\mathrm{TR}/3,0.015)$; categorical levels redrawn with probability $0.15$), and, with probability $0.25(1-n/B)$, 200 global draws of the active coordinates around $x^*$. The highest-scoring candidate is chosen.
+1. **UCB.** 600 perturbations of $x_c$ (each active coordinate changed with probability $\mathrm{clip}(4/m,0.25,1)$, at least one forced; real coordinates drawn uniformly in $[x_c-\mathrm{TR}/2,x_c+\mathrm{TR}/2]$ clipped to $[0,1]$, categorical coordinates redrawn uniformly). The highest-scoring candidate is chosen.
 2. **Block.** One random block is chosen. 250 candidates copy $x_c$ and set the block's coordinates from a point drawn from the best $\min(n,12)$ observations plus $\mathcal N(0,(0.20\min(1,2\mathrm{TR}))^2)$ noise (categorical coordinates take that point's level with probability $0.5$, otherwise a random level). The highest-scoring candidate is chosen.
 3. **Direction.** For each real active coordinate a slope $g_j=\mathrm{cov}(x_j-x^*_j,\tilde y)/(\mathrm{var}(x_j-x^*_j)+10^{-4})$ is estimated from the $4m+8$ observations nearest to $x^*$ (distance over active coordinates), where $\tilde y$ are the rank scores. The normalized direction is blended $0.7/0.3$ with the previous successful direction, and the step in $\{0.1,0.25,0.5,0.8,1.2,1.8\}\mathrm{TR}$ with the best surrogate mean is chosen. Categorical coordinates stay at the values of $x^*$.
 4. **Inactive.** Starting from $x^*$, change $\min(q',\max(1,\mathrm{round}(0.3q')))$ of the $q'$ inactive coordinates, using the recorded good values with probability $0.6$ (if any selected coordinate has one) and otherwise random values (uniform on $[0.05,0.95]$, or a random level).
+5. **Proxy-star.** Sample a retained direct or inferred relationship in proportion to its heuristic confidence. Generate 160 candidates that move the endpoints in the inferred same/opposite directions; inferred hypotheses also perturb their mediator. Endpoint step magnitudes are sampled independently so a chained direction does not force equal influence, and the highest UCB-scoring candidate is evaluated.
 
-Strategy 2 is available only when there are at least two blocks, and strategy 4 only when some coordinate is inactive.
+Block is available only when at least two blocks exist, Inactive only when some coordinate is inactive, and Proxy-star only when at least one relationship hypothesis remains after pruning.
 
 ## Adaptation
 
-A strategy is chosen by a Thompson-sampling-style rule: for each available strategy draw $G_w\sim\mathrm{Gamma}(w,1)$ and $G_l\sim\mathrm{Gamma}(l,1)$ and pick the largest $G_w/(G_w+G_l)$. Initially $w=(2,1,1,1)$ and $l=(1,1,1,1)$. After every evaluation both counts are pulled toward one by a factor $0.96$. An evaluation is an improvement if its effective score exceeds the previous best by more than $10^{-12}$; then the chosen strategy's $w$ increases by $1.2$, otherwise its $l$ increases by $1$.
+A strategy is chosen by a Thompson-sampling-style rule: for each available strategy draw $G_w\sim\mathrm{Gamma}(w,1)$ and $G_l\sim\mathrm{Gamma}(l,1)$ and pick the largest $G_w/(G_w+G_l)$. Initially $w=(2,1,1,1,1)$ and $l=(1,1,1,1,1)$. After every evaluation both counts are pulled toward one by a factor $0.96$. An evaluation is an improvement if its effective score exceeds the previous best by more than $10^{-12}$; then the chosen strategy's $w$ increases by $1.2$, otherwise its $l$ increases by $1$.
 
-The trust region starts at $0.45$, is multiplied by $1.5$ (capped at $0.85$) after two consecutive improvements, and divided by $1.8$ (floored at $10^{-3}$) after $\max(2,\lceil m/4\rceil)$ consecutive failures. When it falls to $0.005$ or below, it restarts at $0.30$ around a random one of the six best observations and the direction memory is cleared. Re-selection of active coordinates and blocks happens at $\lfloor0.55B\rfloor$ and $\lfloor0.80B\rfloor$ evaluations if more than ten evaluations remain; it also resets the surrogate and direction memory.
+The trust region starts at $0.45$, is multiplied by $1.5$ (capped at $0.85$) after two consecutive improvements, and divided by $1.8$ (floored at $10^{-3}$) after $\max(2,\lceil m/4\rceil)$ consecutive failures. When it falls to $0.005$ or below, it restarts at $0.30$ around a random one of the six best observations, clears direction memory, and re-estimates active coordinates. Active coordinates are also re-estimated after an improvement. Relationship hypotheses and blocks are reconstructed from the current observations for every proposal; no refresh is tied to a fraction of the remaining budget.
 
 | Quantity | Default |
 |---|---|
-| Screening points $n_s$ | $B\le45$: $\min(B,\max(6,\lfloor0.14B\rfloor))$; else $\min(B,\mathrm{clip}(\lfloor0.18B\rfloor,8,22))$ |
-| Integration points | $B\le45$: $\min(B-n_s,\max(3,\lfloor0.08B\rfloor))$; else $\min(B-n_s,\mathrm{clip}(\lfloor0.10B\rfloor,4,14))$ |
-| Latin hypercube | one point per equal-width stratum of each active coordinate [@McKay1979] |
-| Screening thresholds | effect $\ge0.22$ in 24 half-samples; block correlation $\ge0.20$ |
-| Candidates per proposal | 400 + 200 (+200) for UCB; 250 for Block; 6 steps for Direction |
+| Grouped bootstrap points | $\min(B,6)$ |
+| Direct relationship filter | $|r|\ge0.15$ and sign stability $\ge0.70$ across 24 half-samples |
+| Proxy-star pruning | confidence $\ge0.20$; chained directions compose by sign multiplication |
+| Candidates per proposal | 600 for UCB; 250 for Block; 160 for Proxy-star; 6 steps for Direction |
 
 ## Batch and parallel evaluation
 
@@ -164,7 +162,7 @@ AHCO uses a fixed seed and the ChaCha8 generator. For a deterministic objective,
 
 - Inputs are the unit cube with unordered categorical levels; there are no integer or log-scale types and no noise model.
 - Screening relies on correlations and effect sizes. It can miss non-monotone effects that are not roughly quadratic, purely interactive effects, and (in the stability term) interior optima, which the linear correlation does not capture. Interactions involving categorical coordinates are not detected.
-- The constants in the table and the strategy settings were chosen by hand and have not been tuned or ablated.
+- The relationship thresholds and strategy settings are heuristics chosen by hand and have not been tuned or ablated; the proxy-star policy has not yet been benchmarked.
 - Rank-transformed scores discard magnitude information.
 - Sequential runs apply no penalty against recently evaluated points. Preliminary checks suggest sequential runs can stagnate late in a run, so results should be validated per problem.
 - `Penalty` weights depend on the scale of the objective, and the sentinel $-10^{100}$ assumes ordinary scores exceed it.

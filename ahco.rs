@@ -1,4 +1,3 @@
-
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -533,9 +532,9 @@ where
     let budget = config.budget;
     let mut archive = Archive::new(budget, config.constraint_mode, constraint_ref.is_some());
 
-    // ---- screening design ----
-    let screen = screen_count(budget).min(budget);
-    let design = grouped_design(screen, dimension, &space, constraint_ref, &mut rng);
+    // A small grouped bootstrap is needed before score-based hypotheses are useful.
+    let bootstrap = budget.min(6);
+    let design = grouped_design(bootstrap, dimension, &space, constraint_ref, &mut rng);
     for point in design {
         evaluate_one(&mut archive, &point, constraint_ref, &mut objective)?;
     }
@@ -551,30 +550,16 @@ where
         None,
         &mut rng,
     );
-    let initial_best = archive.points[argmax(&archive.scores)].clone();
-    let integration = integration_count(budget).min(budget - archive.points.len());
-    let mut integration_points = Vec::with_capacity(integration);
-    for sample in latin_hypercube(integration, active.len(), &mut rng) {
-        let mut point = initial_best.clone();
-        for (index, &feature) in active.iter().enumerate() {
-            point[feature] = sample[index];
-        }
-        space.snap(&mut point);
-        integration_points.push(repair(point, &active, &space, constraint_ref, &mut rng));
-    }
-    for point in integration_points {
-        evaluate_one(&mut archive, &point, constraint_ref, &mut objective)?;
-    }
 
-    let mut blocks = pair_blocks(&archive.points, &archive.scores, &active, &space);
     let strategies = [
         Strategy::Ucb,
         Strategy::Block,
         Strategy::Direction,
         Strategy::Inactive,
+        Strategy::ProxyStar,
     ];
-    let mut wins = [2.0, 1.0, 1.0, 1.0];
-    let mut losses = [1.0; 4];
+    let mut wins = [2.0, 1.0, 1.0, 1.0, 1.0];
+    let mut losses = [1.0; 5];
     let mut trust_region = 0.45;
     let mut successes = 0usize;
     let mut failures = 0usize;
@@ -582,37 +567,15 @@ where
     let mut momentum = vec![0.0; active.len()];
     let mut model: Option<Forest> = None;
     let mut last_fit = 0usize;
-    let checkpoints = [budget * 55 / 100, budget * 80 / 100];
-    let mut checkpoint_done = [false; 2];
 
     while archive.points.len() < budget {
         let count = archive.points.len();
-        for checkpoint in 0..checkpoints.len() {
-            if count >= checkpoints[checkpoint]
-                && !checkpoint_done[checkpoint]
-                && budget - count > 10
-            {
-                checkpoint_done[checkpoint] = true;
-                let selection = choose_active(
-                    &archive.points,
-                    &archive.scores,
-                    &space,
-                    min_active,
-                    max_active,
-                    Some(&active),
-                    &mut rng,
-                );
-                active = selection.0;
-                maxima = selection.1;
-                blocks = pair_blocks(&archive.points, &archive.scores, &active, &space);
-                momentum = vec![0.0; active.len()];
-                model = None;
-            }
-        }
-
         let inactive: Vec<usize> = (0..dimension)
             .filter(|feature| !active.contains(feature))
             .collect();
+        let hypotheses =
+            proxy_star_hypotheses(&archive.points, &archive.scores, &active, &space, &mut rng);
+        let blocks = relationship_blocks(&active, &hypotheses);
         let best_index = argmax(&archive.scores);
         let best = archive.points[best_index].clone();
         let center = center_index
@@ -631,15 +594,15 @@ where
             last_fit = count;
         }
         let fitted = model.as_ref().expect("surrogate is fit before proposing");
-        let progress = count as f64 / budget as f64;
-        let beta = 1.4 * (1.0 - progress).powf(1.2) + 0.15;
+        let beta = 1.4;
         let perturb_probability = (4.0 / active.len().max(1) as f64).clamp(0.25, 1.0);
         let available: Vec<usize> = strategies
             .iter()
             .enumerate()
             .filter(|(_, strategy)| {
-                !(**strategy == Strategy::Block && blocks.len() < 2)
-                    && !(**strategy == Strategy::Inactive && inactive.is_empty())
+                !(**strategy == Strategy::Block && blocks.len() < 2
+                    || **strategy == Strategy::Inactive && inactive.is_empty()
+                    || **strategy == Strategy::ProxyStar && hypotheses.is_empty())
             })
             .map(|(index, _)| index)
             .collect();
@@ -651,16 +614,12 @@ where
         };
         let candidate = match strategies[selected_strategy] {
             Strategy::Ucb => propose_ucb(
-                &archive.points,
-                &scores_now,
-                &best,
                 &center,
                 &active,
                 fitted,
                 trust_region,
                 perturb_probability,
                 beta,
-                progress,
                 &ctx,
                 &mut rng,
             ),
@@ -688,6 +647,15 @@ where
                 &mut rng,
             ),
             Strategy::Inactive => propose_inactive(&best, &inactive, &maxima, &ctx, &mut rng),
+            Strategy::ProxyStar => propose_proxy_star(
+                &best,
+                &hypotheses,
+                &active,
+                fitted,
+                trust_region,
+                &ctx,
+                &mut rng,
+            ),
         };
 
         let best_before = argmax(&archive.scores);
@@ -704,6 +672,21 @@ where
             successes += 1;
             failures = 0;
             center_index = None;
+            let selection = choose_active(
+                &archive.points,
+                &archive.scores,
+                &space,
+                min_active,
+                max_active,
+                Some(&active),
+                &mut rng,
+            );
+            if selection.0 != active {
+                momentum = vec![0.0; selection.0.len()];
+                model = None;
+            }
+            active = selection.0;
+            maxima = selection.1;
             if strategies[selected_strategy] == Strategy::Direction {
                 momentum = active
                     .iter()
@@ -729,6 +712,18 @@ where
                     top.truncate(6);
                     center_index = top.choose(&mut rng).copied();
                     momentum.fill(0.0);
+                    let selection = choose_active(
+                        &archive.points,
+                        &archive.scores,
+                        &space,
+                        min_active,
+                        max_active,
+                        Some(&active),
+                        &mut rng,
+                    );
+                    active = selection.0;
+                    maxima = selection.1;
+                    model = None;
                 }
             }
         }
@@ -741,7 +736,7 @@ where
         .filter(|violation| **violation > 0.0)
         .count();
     Ok(OptimizationResult {
-        method: "AHCO-v4",
+        method: "AHCO-ProxyStar-research",
         best_score: archive.values[best_index],
         best_x: archive.points[best_index].clone(),
         feasible: archive.violations[best_index] <= 0.0,
@@ -758,6 +753,7 @@ enum Strategy {
     Block,
     Direction,
     Inactive,
+    ProxyStar,
 }
 
 fn validate_config(config: &AhcoConfig) -> Result<(), AhcoError> {
@@ -783,22 +779,6 @@ fn validate_config(config: &AhcoConfig) -> Result<(), AhcoError> {
         }
     }
     Ok(())
-}
-
-fn screen_count(budget: usize) -> usize {
-    if budget <= 45 {
-        ((budget as f64 * 0.14) as usize).max(6)
-    } else {
-        ((budget as f64 * 0.18) as usize).clamp(8, 22)
-    }
-}
-
-fn integration_count(budget: usize) -> usize {
-    if budget <= 45 {
-        ((budget as f64 * 0.08) as usize).max(3)
-    } else {
-        ((budget as f64 * 0.10) as usize).clamp(4, 14)
-    }
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -849,51 +829,6 @@ fn grouped_design(
         design.push(best.expect("at least one design draw"));
     }
     design
-}
-
-fn latin_hypercube(count: usize, dimension: usize, rng: &mut ChaCha8Rng) -> Vec<Vec<f64>> {
-    let mut samples = vec![vec![0.0; dimension]; count];
-    for feature in 0..dimension {
-        let mut strata: Vec<usize> = (0..count).collect();
-        strata.shuffle(rng);
-        for row in 0..count {
-            samples[row][feature] = (strata[row] as f64 + rng.gen::<f64>()) / count as f64;
-        }
-    }
-    samples
-}
-
-fn repair(
-    point: Vec<f64>,
-    active: &[usize],
-    space: &Space,
-    constraint: Option<&Constraint>,
-    rng: &mut ChaCha8Rng,
-) -> Vec<f64> {
-    let Some(constraint) = constraint else {
-        return point;
-    };
-    let mut best_violation = constraint.violation(&point);
-    if best_violation <= 0.0 {
-        return point;
-    }
-    let mut best = point.clone();
-    for _ in 0..30 {
-        let mut trial = point.clone();
-        for &feature in active {
-            trial[feature] = rng.gen();
-        }
-        space.snap(&mut trial);
-        let violation = constraint.violation(&trial);
-        if violation < best_violation {
-            best_violation = violation;
-            best = trial;
-            if violation <= 0.0 {
-                break;
-            }
-        }
-    }
-    best
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -1085,16 +1020,24 @@ fn quadratic_fit(x: &[f64], y: &[f64]) -> (f64, f64) {
     }
 }
 
-/// Interaction blocks among REAL active dims via product-correlation union-find;
-/// each categorical active dim is its own block.
-fn pair_blocks(
+#[derive(Clone, Debug)]
+struct ProxyHypothesis {
+    left: usize,
+    right: usize,
+    direction: i8,
+    confidence: f64,
+    mediator: Option<usize>,
+}
+
+fn proxy_star_hypotheses(
     points: &[Vec<f64>],
     scores: &[f64],
     active: &[usize],
     space: &Space,
-) -> Vec<Vec<usize>> {
-    if active.len() < 2 || points.len() < 12 {
-        return active.iter().map(|&feature| vec![feature]).collect();
+    rng: &mut ChaCha8Rng,
+) -> Vec<ProxyHypothesis> {
+    if active.len() < 2 || points.len() < 8 {
+        return Vec::new();
     }
     let target = rank_scores(scores);
     let real: Vec<usize> = active
@@ -1102,31 +1045,122 @@ fn pair_blocks(
         .copied()
         .filter(|&feature| !space.is_cat(feature))
         .collect();
-    let mut parent: Vec<usize> = (0..real.len()).collect();
+    let mut direct = Vec::new();
     for left in 0..real.len() {
         for right in left + 1..real.len() {
             let product: Vec<f64> = points
                 .iter()
                 .map(|point| (2.0 * point[real[left]] - 1.0) * (2.0 * point[real[right]] - 1.0))
                 .collect();
-            if correlation(&product, &target).abs() >= 0.20 {
-                union(&mut parent, left, right);
+            let effect = correlation(&product, &target);
+            if effect.abs() < 0.15 {
+                continue;
+            }
+
+            let sample_size = points.len().div_ceil(2).max(4).min(points.len());
+            let mut consistent = 0usize;
+            for _ in 0..24 {
+                let mut indices: Vec<usize> = (0..points.len()).collect();
+                indices.shuffle(rng);
+                indices.truncate(sample_size);
+                let sampled_product: Vec<f64> =
+                    indices.iter().map(|&index| product[index]).collect();
+                let sampled_target: Vec<f64> = indices.iter().map(|&index| target[index]).collect();
+                let sampled_effect = correlation(&sampled_product, &sampled_target);
+                if sampled_effect * effect > 0.0 {
+                    consistent += 1;
+                }
+            }
+            let stability = consistent as f64 / 24.0;
+            if stability >= 0.70 {
+                direct.push(ProxyHypothesis {
+                    left: real[left],
+                    right: real[right],
+                    direction: if effect >= 0.0 { 1 } else { -1 },
+                    confidence: stability * (effect.abs() / 0.4).min(1.0),
+                    mediator: None,
+                });
             }
         }
     }
-    let mut blocks: Vec<Vec<usize>> = Vec::new();
-    let mut roots: Vec<usize> = Vec::new();
-    for index in 0..real.len() {
-        let root = find(&mut parent, index);
-        if let Some(position) = roots.iter().position(|&candidate| candidate == root) {
-            blocks[position].push(real[index]);
-        } else {
-            roots.push(root);
-            blocks.push(vec![real[index]]);
+
+    let mut hypotheses = direct.clone();
+    for (first_index, first) in direct.iter().enumerate() {
+        for second in direct.iter().skip(first_index + 1) {
+            let (mediator, left, right) = if first.left == second.left {
+                (first.left, first.right, second.right)
+            } else if first.left == second.right {
+                (first.left, first.right, second.left)
+            } else if first.right == second.left {
+                (first.right, first.left, second.right)
+            } else if first.right == second.right {
+                (first.right, first.left, second.left)
+            } else {
+                continue;
+            };
+            if left == right {
+                continue;
+            }
+            let confidence = first.confidence * second.confidence;
+            if confidence < 0.20 {
+                continue;
+            }
+            let inferred = ProxyHypothesis {
+                left,
+                right,
+                direction: first.direction * second.direction,
+                confidence,
+                mediator: Some(mediator),
+            };
+            let pair = ordered_pair(inferred.left, inferred.right);
+            if let Some(existing) = hypotheses
+                .iter_mut()
+                .find(|hypothesis| ordered_pair(hypothesis.left, hypothesis.right) == pair)
+            {
+                if inferred.confidence > existing.confidence {
+                    *existing = inferred;
+                }
+            } else {
+                hypotheses.push(inferred);
+            }
         }
     }
-    for &feature in active {
-        if space.is_cat(feature) {
+    hypotheses
+}
+
+fn ordered_pair(left: usize, right: usize) -> (usize, usize) {
+    if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+fn relationship_blocks(active: &[usize], hypotheses: &[ProxyHypothesis]) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..active.len()).collect();
+    for hypothesis in hypotheses {
+        let Some(left) = active
+            .iter()
+            .position(|&feature| feature == hypothesis.left)
+        else {
+            continue;
+        };
+        let Some(right) = active
+            .iter()
+            .position(|&feature| feature == hypothesis.right)
+        else {
+            continue;
+        };
+        union(&mut parent, left, right);
+    }
+    let mut blocks: Vec<Vec<usize>> = Vec::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (index, &feature) in active.iter().enumerate() {
+        let root = find(&mut parent, index);
+        if let Some(position) = roots.iter().position(|&candidate| candidate == root) {
+            blocks[position].push(feature);
+        } else {
+            roots.push(root);
             blocks.push(vec![feature]);
         }
     }
@@ -1196,23 +1230,18 @@ fn pick_best(
 }
 
 fn propose_ucb(
-    points: &[Vec<f64>],
-    scores: &[f64],
-    best: &[f64],
     center: &[f64],
     active: &[usize],
     model: &Forest,
     trust_region: f64,
     perturb_probability: f64,
     beta: f64,
-    progress: f64,
     ctx: &Ctx,
     rng: &mut ChaCha8Rng,
 ) -> Vec<f64> {
     let space = ctx.space;
-    let normal = Normal::new(0.0, (trust_region / 3.0).max(0.015)).expect("positive deviation");
-    let mut candidates = Vec::with_capacity(800);
-    for _ in 0..400 {
+    let mut candidates = Vec::with_capacity(600);
+    for _ in 0..600 {
         let mut candidate = center.to_vec();
         let forced = rng.gen_range(0..active.len());
         for (index, &feature) in active.iter().enumerate() {
@@ -1231,31 +1260,6 @@ fn propose_ucb(
             }
         }
         candidates.push(candidate);
-    }
-    let mut elite: Vec<usize> = (0..scores.len()).collect();
-    elite.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
-    elite.truncate(3);
-    for _ in 0..200 {
-        let mut candidate = points[*elite.choose(rng).expect("non-empty observations")].clone();
-        for &feature in active {
-            if space.is_cat(feature) {
-                if rng.gen_bool(0.15) {
-                    candidate[feature] = space.random_level(feature, rng);
-                }
-            } else {
-                candidate[feature] = (candidate[feature] + normal.sample(rng)).clamp(0.0, 1.0);
-            }
-        }
-        candidates.push(candidate);
-    }
-    if rng.gen_bool((0.25 * (1.0 - progress)).clamp(0.0, 1.0)) {
-        for _ in 0..200 {
-            let mut candidate = best.to_vec();
-            for &feature in active {
-                candidate[feature] = rng.gen();
-            }
-            candidates.push(candidate);
-        }
     }
     pick_best(candidates, model, active, beta, ctx)
 }
@@ -1414,10 +1418,54 @@ fn propose_inactive(
     candidate
 }
 
+fn propose_proxy_star(
+    best: &[f64],
+    hypotheses: &[ProxyHypothesis],
+    active: &[usize],
+    model: &Forest,
+    trust_region: f64,
+    ctx: &Ctx,
+    rng: &mut ChaCha8Rng,
+) -> Vec<f64> {
+    let total_confidence: f64 = hypotheses
+        .iter()
+        .map(|hypothesis| hypothesis.confidence)
+        .sum();
+    let mut draw = rng.gen::<f64>() * total_confidence;
+    let mut selected = &hypotheses[0];
+    for hypothesis in hypotheses {
+        draw -= hypothesis.confidence;
+        if draw <= 0.0 {
+            selected = hypothesis;
+            break;
+        }
+    }
+
+    let mut candidates = Vec::with_capacity(160);
+    for _ in 0..160 {
+        let mut candidate = best.to_vec();
+        let sign = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
+        let distance = rng.gen_range(0.1..=1.0) * trust_region;
+        let left_distance = distance * rng.gen_range(0.5..1.5);
+        let right_distance = distance * rng.gen_range(0.5..1.5);
+        candidate[selected.left] = (best[selected.left] + sign * left_distance).clamp(0.0, 1.0);
+        candidate[selected.right] = (best[selected.right]
+            + sign * selected.direction as f64 * right_distance)
+            .clamp(0.0, 1.0);
+        if let Some(mediator) = selected.mediator {
+            let mediator_distance = distance * rng.gen_range(0.5..1.5);
+            candidate[mediator] =
+                (best[mediator] + rng.gen_range(-1.0..1.0) * mediator_distance).clamp(0.0, 1.0);
+        }
+        candidates.push(candidate);
+    }
+    pick_best(candidates, model, active, 1.4, ctx)
+}
+
 fn sample_strategy(
     available: &[usize],
-    wins: &[f64; 4],
-    losses: &[f64; 4],
+    wins: &[f64; 5],
+    losses: &[f64; 5],
     rng: &mut ChaCha8Rng,
 ) -> usize {
     let mut best = available[0];
@@ -1566,8 +1614,11 @@ mod python {
 #[cfg(test)]
 mod tests {
     use super::{
-        optimize, optimize_eval, AhcoConfig, AhcoError, ConstraintMode, Evaluation, ParamKind,
+        optimize, optimize_eval, proxy_star_hypotheses, AhcoConfig, AhcoError, ConstraintMode,
+        Evaluation, ParamKind, Space,
     };
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
 
     #[test]
     fn evaluates_exact_budget_and_returns_bounded_best_point() {
@@ -1576,12 +1627,52 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result.evaluations, 25);
+        assert_eq!(result.method, "AHCO-ProxyStar-research");
         assert_eq!(result.history.len(), 25);
         assert!(result
             .best_x
             .iter()
             .all(|value| (0.0..=1.0).contains(value)));
         assert!(result.history.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn proxy_star_composes_opposite_pair_directions() {
+        let mut rng = ChaCha8Rng::seed_from_u64(2026);
+        let points: Vec<Vec<f64>> = (0..400)
+            .map(|_| vec![rng.gen(), rng.gen(), rng.gen()])
+            .collect();
+        let scores: Vec<f64> = points
+            .iter()
+            .map(|point| {
+                let a = 2.0 * point[0] - 1.0;
+                let b = 2.0 * point[1] - 1.0;
+                let c = 2.0 * point[2] - 1.0;
+                a * b - b * c
+            })
+            .collect();
+        let space = Space { levels: vec![0; 3] };
+        let hypotheses = proxy_star_hypotheses(&points, &scores, &[0, 1, 2], &space, &mut rng);
+
+        assert!(hypotheses.iter().any(|hypothesis| {
+            hypothesis.mediator == Some(1)
+                && (hypothesis.left, hypothesis.right) == (0, 2)
+                && hypothesis.direction == -1
+                && hypothesis.confidence >= 0.20
+        }));
+    }
+
+    #[test]
+    fn proxy_star_requires_sufficient_observations() {
+        let space = Space { levels: vec![0; 2] };
+        let hypotheses = proxy_star_hypotheses(
+            &vec![vec![0.1, 0.9]; 7],
+            &[0.0; 7],
+            &[0, 1],
+            &space,
+            &mut ChaCha8Rng::seed_from_u64(1),
+        );
+        assert!(hypotheses.is_empty());
     }
 
     #[test]
