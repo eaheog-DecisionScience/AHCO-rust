@@ -570,15 +570,23 @@ where
     let mut momentum = vec![0.0; active.len()];
     let mut model: Option<Forest> = None;
     let mut last_fit = 0usize;
+    let mut last_relationship_refresh = bootstrap;
+    let mut relationship_active = active.clone();
+    let mut hypotheses = Vec::new();
+    let mut blocks = relationship_blocks(&active, &hypotheses);
 
     while archive.points.len() < budget {
         let count = archive.points.len();
+        if count.saturating_sub(last_relationship_refresh) >= 3 || relationship_active != active {
+            hypotheses =
+                proxy_star_hypotheses(&archive.points, &archive.scores, &active, &space, &mut rng);
+            blocks = relationship_blocks(&active, &hypotheses);
+            relationship_active.clone_from(&active);
+            last_relationship_refresh = count;
+        }
         let inactive: Vec<usize> = (0..dimension)
             .filter(|feature| !active.contains(feature))
             .collect();
-        let hypotheses =
-            proxy_star_hypotheses(&archive.points, &archive.scores, &active, &space, &mut rng);
-        let blocks = relationship_blocks(&active, &hypotheses);
         let best_index = argmax(&archive.scores);
         let best = archive.points[best_index].clone();
         let center = center_index
@@ -905,6 +913,67 @@ fn eta(levels: &[usize], y: &[f64], n: usize) -> f64 {
     (between / total).sqrt()
 }
 
+fn eta_at_indices(
+    points: &[Vec<f64>],
+    feature: usize,
+    target: &[f64],
+    levels: usize,
+    indices: &[usize],
+    space: &Space,
+) -> f64 {
+    let count = indices.len() as f64;
+    let grand = indices.iter().map(|&index| target[index]).sum::<f64>() / count;
+    let mut total = 0.0;
+    let mut sums = vec![0.0; levels];
+    let mut counts = vec![0usize; levels];
+    for &index in indices {
+        let score = target[index];
+        total += (score - grand).powi(2);
+        let level = space.level(feature, points[index][feature]);
+        sums[level] += score;
+        counts[level] += 1;
+    }
+    if total < 1.0e-12 {
+        return 0.0;
+    }
+    let between = sums
+        .iter()
+        .zip(counts)
+        .filter(|(_, count)| *count > 0)
+        .map(|(sum, count)| count as f64 * (sum / count as f64 - grand).powi(2))
+        .sum::<f64>();
+    (between / total).sqrt()
+}
+
+fn correlation_coordinate_at_indices(
+    points: &[Vec<f64>],
+    feature: usize,
+    target: &[f64],
+    indices: &[usize],
+) -> f64 {
+    let count = indices.len() as f64;
+    let x_mean = indices
+        .iter()
+        .map(|&index| points[index][feature])
+        .sum::<f64>()
+        / count;
+    let y_mean = indices.iter().map(|&index| target[index]).sum::<f64>() / count;
+    let (mut covariance, mut x_variance, mut y_variance) = (0.0, 0.0, 0.0);
+    for &index in indices {
+        let x = points[index][feature] - x_mean;
+        let y = target[index] - y_mean;
+        covariance += x * y;
+        x_variance += x.powi(2);
+        y_variance += y.powi(2);
+    }
+    let denominator = (x_variance * y_variance).sqrt();
+    if denominator <= 1.0e-12 {
+        0.0
+    } else {
+        (covariance / denominator).clamp(-1.0, 1.0)
+    }
+}
+
 fn choose_active(
     points: &[Vec<f64>],
     scores: &[f64],
@@ -974,22 +1043,28 @@ fn choose_active(
 
     let bootstraps = 24usize;
     let sample_size = points.len().div_ceil(2).max(6).min(points.len());
+    let bootstrap_samples: Vec<Vec<usize>> = (0..bootstraps)
+        .map(|_| {
+            let mut indices: Vec<usize> = (0..points.len()).collect();
+            indices.shuffle(rng);
+            indices.truncate(sample_size);
+            indices
+        })
+        .collect();
     let mut selected_count = vec![0usize; dimension];
-    for _ in 0..bootstraps {
-        let mut indices: Vec<usize> = (0..points.len()).collect();
-        indices.shuffle(rng);
-        indices.truncate(sample_size);
-        let y: Vec<f64> = indices.iter().map(|&i| target[i]).collect();
+    for indices in &bootstrap_samples {
         for feature in 0..dimension {
             let strength = if space.is_cat(feature) {
-                let levels: Vec<usize> = indices
-                    .iter()
-                    .map(|&i| space.level(feature, points[i][feature]))
-                    .collect();
-                eta(&levels, &y, space.levels[feature])
+                eta_at_indices(
+                    points,
+                    feature,
+                    &target,
+                    space.levels[feature],
+                    indices,
+                    space,
+                )
             } else {
-                let x: Vec<f64> = indices.iter().map(|&i| points[i][feature]).collect();
-                correlation(&x, &y).abs()
+                correlation_coordinate_at_indices(points, feature, &target, indices).abs()
             };
             if strength >= 0.22 {
                 selected_count[feature] += 1;
@@ -1076,6 +1151,15 @@ fn proxy_star_hypotheses(
         .copied()
         .filter(|&feature| !space.is_cat(feature))
         .collect();
+    let sample_size = points.len().div_ceil(2).max(4).min(points.len());
+    let bootstrap_samples: Vec<Vec<usize>> = (0..24)
+        .map(|_| {
+            let mut indices: Vec<usize> = (0..points.len()).collect();
+            indices.shuffle(rng);
+            indices.truncate(sample_size);
+            indices
+        })
+        .collect();
     let mut direct = Vec::new();
     for left in 0..real.len() {
         for right in left + 1..real.len() {
@@ -1088,16 +1172,9 @@ fn proxy_star_hypotheses(
                 continue;
             }
 
-            let sample_size = points.len().div_ceil(2).max(4).min(points.len());
             let mut consistent = 0usize;
-            for _ in 0..24 {
-                let mut indices: Vec<usize> = (0..points.len()).collect();
-                indices.shuffle(rng);
-                indices.truncate(sample_size);
-                let sampled_product: Vec<f64> =
-                    indices.iter().map(|&index| product[index]).collect();
-                let sampled_target: Vec<f64> = indices.iter().map(|&index| target[index]).collect();
-                let sampled_effect = correlation(&sampled_product, &sampled_target);
+            for indices in &bootstrap_samples {
+                let sampled_effect = correlation_at_indices(&product, &target, indices);
                 if sampled_effect * effect > 0.0 {
                     consistent += 1;
                 }
@@ -1605,8 +1682,8 @@ fn propose_proxy_star(
         }
     }
 
-    let mut candidates = Vec::with_capacity(160);
-    for _ in 0..160 {
+    let mut candidates = Vec::with_capacity(64);
+    for _ in 0..64 {
         let mut candidate = best.to_vec();
         let sign = if rng.gen_bool(0.5) { 1.0 } else { -1.0 };
         let distance = rng.gen_range(0.1..=1.0) * trust_region;
@@ -1686,6 +1763,36 @@ fn correlation(left: &[f64], right: &[f64]) -> f64 {
         0.0
     } else {
         (covariance(left, right) / denominator).clamp(-1.0, 1.0)
+    }
+}
+
+fn correlation_at_indices(left: &[f64], right: &[f64], indices: &[usize]) -> f64 {
+    if left.len() != right.len() || indices.is_empty() {
+        return 0.0;
+    }
+    let count = indices.len() as f64;
+    let left_mean = indices.iter().map(|&index| left[index]).sum::<f64>() / count;
+    let right_mean = indices.iter().map(|&index| right[index]).sum::<f64>() / count;
+    let covariance = indices
+        .iter()
+        .map(|&index| (left[index] - left_mean) * (right[index] - right_mean))
+        .sum::<f64>()
+        / count;
+    let left_variance = indices
+        .iter()
+        .map(|&index| (left[index] - left_mean).powi(2))
+        .sum::<f64>()
+        / count;
+    let right_variance = indices
+        .iter()
+        .map(|&index| (right[index] - right_mean).powi(2))
+        .sum::<f64>()
+        / count;
+    let denominator = (left_variance * right_variance).sqrt();
+    if denominator <= 1.0e-12 {
+        0.0
+    } else {
+        (covariance / denominator).clamp(-1.0, 1.0)
     }
 }
 
@@ -1778,8 +1885,9 @@ mod python {
 #[cfg(test)]
 mod tests {
     use super::{
-        group_dimension_weights, optimize, optimize_eval, proxy_star_hypotheses, sample_group_size,
-        AhcoConfig, AhcoError, ConstraintMode, Evaluation, ParamKind, Space,
+        correlation, correlation_at_indices, correlation_coordinate_at_indices, eta,
+        eta_at_indices, group_dimension_weights, optimize, optimize_eval, proxy_star_hypotheses,
+        sample_group_size, AhcoConfig, AhcoError, ConstraintMode, Evaluation, ParamKind, Space,
     };
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -1871,6 +1979,54 @@ mod tests {
             &mut ChaCha8Rng::seed_from_u64(1),
         );
         assert!(hypotheses.is_empty());
+    }
+
+    #[test]
+    fn indexed_correlation_matches_materialized_sample() {
+        let left = [0.2, 0.8, 0.4, 0.6];
+        let right = [0.7, 0.1, 0.2, 0.9];
+        let indices = [0, 2, 3];
+        let sampled_left: Vec<f64> = indices.iter().map(|&index| left[index]).collect();
+        let sampled_right: Vec<f64> = indices.iter().map(|&index| right[index]).collect();
+
+        assert!(
+            (correlation_at_indices(&left, &right, &indices)
+                - correlation(&sampled_left, &sampled_right))
+            .abs()
+                < 1.0e-12
+        );
+    }
+
+    #[test]
+    fn indexed_screening_statistics_match_materialized_samples() {
+        let points = vec![
+            vec![0.1, 0.1],
+            vec![0.4, 0.5],
+            vec![0.7, 0.8],
+            vec![0.9, 0.2],
+        ];
+        let target = [0.2, 0.8, -0.5, 0.4];
+        let indices = [0, 2, 3];
+        let sampled_target: Vec<f64> = indices.iter().map(|&index| target[index]).collect();
+        let sampled_real: Vec<f64> = indices.iter().map(|&index| points[index][0]).collect();
+        let sampled_levels: Vec<usize> = indices
+            .iter()
+            .map(|&index| (points[index][1] * 3.0) as usize)
+            .collect();
+        let space = Space { levels: vec![0, 3] };
+
+        assert!(
+            (correlation_coordinate_at_indices(&points, 0, &target, &indices)
+                - correlation(&sampled_real, &sampled_target))
+            .abs()
+                < 1.0e-12
+        );
+        assert!(
+            (eta_at_indices(&points, 1, &target, 3, &indices, &space)
+                - eta(&sampled_levels, &sampled_target, 3))
+            .abs()
+                < 1.0e-12
+        );
     }
 
     #[test]
