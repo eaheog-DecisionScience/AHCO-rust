@@ -557,9 +557,12 @@ where
         Strategy::Direction,
         Strategy::Inactive,
         Strategy::ProxyStar,
+        Strategy::GroupHypothesis,
     ];
-    let mut wins = [2.0, 1.0, 1.0, 1.0, 1.0];
-    let mut losses = [1.0; 5];
+    let mut wins = [2.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    let mut losses = [1.0; 6];
+    let mut group_trials = vec![0usize; dimension];
+    let mut group_successes = vec![0usize; dimension];
     let mut trust_region = 0.45;
     let mut successes = 0usize;
     let mut failures = 0usize;
@@ -656,12 +659,39 @@ where
                 &ctx,
                 &mut rng,
             ),
+            Strategy::GroupHypothesis => propose_group_hypothesis(
+                &archive.points,
+                &transformed_y,
+                &best,
+                &space,
+                &group_trials,
+                &group_successes,
+                &ctx,
+                &mut rng,
+            ),
+        };
+        let group = if strategies[selected_strategy] == Strategy::GroupHypothesis {
+            Some(
+                (0..dimension)
+                    .filter(|&feature| (candidate[feature] - best[feature]).abs() > 1.0e-12)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
         };
 
         let best_before = argmax(&archive.scores);
         evaluate_one(&mut archive, &candidate, constraint_ref, &mut objective)?;
         let new_index = archive.points.len() - 1;
         let improved = archive.scores[new_index] > archive.scores[best_before] + 1.0e-12;
+        if let Some(group) = group {
+            for feature in group {
+                group_trials[feature] += 1;
+                if improved {
+                    group_successes[feature] += 1;
+                }
+            }
+        }
 
         for index in 0..wins.len() {
             wins[index] = 1.0 + 0.96 * (wins[index] - 1.0);
@@ -736,7 +766,7 @@ where
         .filter(|violation| **violation > 0.0)
         .count();
     Ok(OptimizationResult {
-        method: "AHCO-ProxyStar-research",
+        method: "AHCO-AdaptiveGroupedHypothesis-research",
         best_score: archive.values[best_index],
         best_x: archive.points[best_index].clone(),
         feasible: archive.violations[best_index] <= 0.0,
@@ -754,6 +784,7 @@ enum Strategy {
     Direction,
     Inactive,
     ProxyStar,
+    GroupHypothesis,
 }
 
 fn validate_config(config: &AhcoConfig) -> Result<(), AhcoError> {
@@ -1167,6 +1198,139 @@ fn relationship_blocks(active: &[usize], hypotheses: &[ProxyHypothesis]) -> Vec<
     blocks
 }
 
+fn group_dimension_weights(
+    points: &[Vec<f64>],
+    target: &[f64],
+    space: &Space,
+    trials: &[usize],
+    successes: &[usize],
+) -> Vec<f64> {
+    let dimension = space.levels.len();
+    let mut evidence = vec![0.0; dimension];
+    for feature in 0..dimension {
+        evidence[feature] = if space.is_cat(feature) {
+            let levels: Vec<usize> = points
+                .iter()
+                .map(|point| space.level(feature, point[feature]))
+                .collect();
+            eta(&levels, target, space.levels[feature])
+        } else {
+            let values: Vec<f64> = points
+                .iter()
+                .map(|point| 2.0 * point[feature] - 1.0)
+                .collect();
+            let quadratic: Vec<f64> = values
+                .iter()
+                .map(|value| value.powi(2) - 1.0 / 3.0)
+                .collect();
+            correlation(&values, target)
+                .abs()
+                .max(correlation(&quadratic, target).abs())
+        };
+    }
+
+    let evidence_total = evidence.iter().sum::<f64>();
+    let uncertainty: Vec<f64> = trials
+        .iter()
+        .map(|&count| 1.0 / (1.0 + count as f64).sqrt())
+        .collect();
+    let uncertainty_total = uncertainty.iter().sum::<f64>();
+    (0..dimension)
+        .map(|feature| {
+            0.50 / dimension as f64
+                + 0.25 * evidence[feature] / evidence_total.max(1.0e-12)
+                + 0.25 * uncertainty[feature] / uncertainty_total.max(1.0e-12)
+                + 0.10 * successes[feature] as f64
+                    / (2.0 + trials[feature] as f64)
+                    / dimension as f64
+        })
+        .collect()
+}
+
+fn sample_group_size(dimension: usize, rng: &mut ChaCha8Rng) -> usize {
+    let maximum = dimension.min(256);
+    let mut sizes = vec![1usize];
+    while *sizes.last().expect("group size list is non-empty") < maximum {
+        sizes.push((sizes.last().copied().unwrap() * 2).min(maximum));
+    }
+    for size in [dimension / 2, dimension] {
+        if size > 0 && !sizes.contains(&size) {
+            sizes.push(size);
+        }
+    }
+    sizes[rng.gen_range(0..sizes.len())]
+}
+
+fn propose_group_hypothesis(
+    points: &[Vec<f64>],
+    target: &[f64],
+    best: &[f64],
+    space: &Space,
+    group_trials: &[usize],
+    group_successes: &[usize],
+    ctx: &Ctx,
+    rng: &mut ChaCha8Rng,
+) -> Vec<f64> {
+    let dimension = space.levels.len();
+    let weights = group_dimension_weights(points, target, space, group_trials, group_successes);
+    let group_size = sample_group_size(dimension, rng);
+    let mut remaining: Vec<usize> = (0..dimension).collect();
+    let mut group = Vec::with_capacity(group_size);
+    let mut remaining_weight: f64 = weights.iter().sum();
+    for _ in 0..group_size {
+        let mut draw = rng.gen::<f64>() * remaining_weight;
+        let mut selected = remaining.len() - 1;
+        for (position, &feature) in remaining.iter().enumerate() {
+            draw -= weights[feature];
+            if draw <= 0.0 {
+                selected = position;
+                break;
+            }
+        }
+        let feature = remaining.swap_remove(selected);
+        remaining_weight -= weights[feature];
+        group.push(feature);
+    }
+
+    let group_x: Vec<Vec<f64>> = points
+        .iter()
+        .map(|point| space.encode(point, &group))
+        .collect();
+    let (model, _) = Forest::fit(&group_x, target, rng, 30);
+    let mut candidates = Vec::with_capacity(192);
+    for _ in 0..192 {
+        let mut candidate = best.to_vec();
+        let pivot = group[rng.gen_range(0..group.len())];
+        let pivot_value = [0.0, 0.5, 1.0][rng.gen_range(0..3)];
+        for &feature in &group {
+            if feature != pivot && rng.gen_bool(0.25) {
+                continue;
+            }
+            if space.is_cat(feature) {
+                let levels = space.levels[feature];
+                let current = space.level(feature, candidate[feature]);
+                let level = if rng.gen_bool(0.65) {
+                    let draw = rng.gen_range(0..levels - 1);
+                    if draw >= current {
+                        draw + 1
+                    } else {
+                        draw
+                    }
+                } else {
+                    space.level(feature, candidate[feature])
+                };
+                candidate[feature] = (level as f64 + 0.5) / levels as f64;
+            } else if feature == pivot || rng.gen_bool(0.45) {
+                candidate[feature] = pivot_value;
+            } else {
+                candidate[feature] = [0.0, 0.5, 1.0][rng.gen_range(0..3)];
+            }
+        }
+        candidates.push(candidate);
+    }
+    pick_best(candidates, &model, &group, 1.4, ctx)
+}
+
 fn find(parent: &mut [usize], item: usize) -> usize {
     if parent[item] != item {
         let root = find(parent, parent[item]);
@@ -1464,8 +1628,8 @@ fn propose_proxy_star(
 
 fn sample_strategy(
     available: &[usize],
-    wins: &[f64; 5],
-    losses: &[f64; 5],
+    wins: &[f64; 6],
+    losses: &[f64; 6],
     rng: &mut ChaCha8Rng,
 ) -> usize {
     let mut best = available[0];
@@ -1614,8 +1778,8 @@ mod python {
 #[cfg(test)]
 mod tests {
     use super::{
-        optimize, optimize_eval, proxy_star_hypotheses, AhcoConfig, AhcoError, ConstraintMode,
-        Evaluation, ParamKind, Space,
+        group_dimension_weights, optimize, optimize_eval, proxy_star_hypotheses, sample_group_size,
+        AhcoConfig, AhcoError, ConstraintMode, Evaluation, ParamKind, Space,
     };
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
@@ -1627,13 +1791,47 @@ mod tests {
         })
         .unwrap();
         assert_eq!(result.evaluations, 25);
-        assert_eq!(result.method, "AHCO-ProxyStar-research");
+        assert_eq!(result.method, "AHCO-AdaptiveGroupedHypothesis-research");
         assert_eq!(result.history.len(), 25);
         assert!(result
             .best_x
             .iter()
             .all(|value| (0.0..=1.0).contains(value)));
         assert!(result.history.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn grouped_search_weights_influential_and_uncertain_dimensions() {
+        let mut rng = ChaCha8Rng::seed_from_u64(2027);
+        let points: Vec<Vec<f64>> = (0..100)
+            .map(|_| vec![rng.gen(), rng.gen(), rng.gen()])
+            .collect();
+        let scores: Vec<f64> = points.iter().map(|point| point[0]).collect();
+        let space = Space { levels: vec![0; 3] };
+        let weights = group_dimension_weights(
+            &points,
+            &super::rank_scores(&scores),
+            &space,
+            &[0, 0, 4],
+            &[0, 0, 0],
+        );
+
+        assert!(weights[0] > weights[1]);
+        assert!(weights[1] > weights[2]);
+    }
+
+    #[test]
+    fn group_hypothesis_sizes_cover_multiple_scales() {
+        let mut rng = ChaCha8Rng::seed_from_u64(2028);
+        let sizes: Vec<usize> = (0..100)
+            .map(|_| sample_group_size(1_000, &mut rng))
+            .collect();
+
+        assert!(sizes.iter().all(|&size| (1..=1_000).contains(&size)));
+        assert!(sizes.iter().any(|&size| size <= 4));
+        assert!(sizes.iter().any(|&size| size >= 128));
+        assert!(sizes.contains(&500));
+        assert!(sizes.contains(&1_000));
     }
 
     #[test]

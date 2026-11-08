@@ -60,7 +60,7 @@ Broader frameworks may suit users who need many algorithms, integer or log-scale
 
 To evaluate AHCO in its intended high-dimensional, low-budget setting, we ran four deterministic, bounded maximization problems at dimension $d=97$ with a budget of $B=40$ objective calls per run ($B<d$). The suite includes dense Sphere (97 active coordinates), sparse Sphere (10 active coordinates), an ill-conditioned Ellipsoid (97 active coordinates), and Rosenbrock (97 active coordinates). Each analytic objective has known optimum score 0; higher scores are better. The formulations and fixed active-coordinate indices are in [`benchmarks/run_benchmarks.py`](./benchmarks/run_benchmarks.py).
 
-These benchmark results describe the earlier AHCO-v4 policy; they are not an evaluation of the proxy-star research policy described below. The research policy needs its own repeated-seed benchmark and ablation before performance claims can be made.
+These benchmark results describe the earlier AHCO-v4 policy; they are not an evaluation of the proxy-star or adaptive grouped-hypothesis research policies described below. Each research policy needs its own repeated-seed benchmark and ablation before performance claims can be made.
 
 We also ran a 97-parameter, $10\to8\to1$ tanh MLP weight-search task on scikit-learn's diabetes dataset (442 rows, 10 features). For this task only, the 97 decision variables are all network weights and biases, decoded from $[0,1]$ to $[-3,3]$. A fixed shuffled 75/25 split (random state 2025) was used; feature and target scalers were fit on the training partition only. Optimizers maximized negative training MSE. Test MSE was computed once for the best training-score point and was never used to select proposals. Test MSE is in training-standardized target units.
 
@@ -81,6 +81,31 @@ The complete experiment is reproducible with [`benchmarks/README.md`](./benchmar
 
 The diabetes task is one small fixed-split real-data demonstration, not broad evidence of generalization. The earlier notebook comparisons remain exploratory: their one-off outputs, including hand-written control simulators and the California Housing runs, are not used as evidence in this evaluation. We do not report wall-clock superiority, and these results do not establish performance on physical systems or across arbitrary black-box objectives.
 
+### Adaptive grouped-hypothesis prototype
+
+We separately evaluated the grouped-hypothesis policy with the same 40-call budget and seeds 0--19. At 97 dimensions it was compared with saved runs from fixed-allocation AHCO-v4, the proxy-star-only research prototype, Random, TPE, and Nevergrad. The analytic tasks and diabetes split are identical to the earlier experiment.
+
+| 97D task | Fixed AHCO-v4 | Proxy-star | Adaptive grouped hypothesis |
+|---|---:|---:|---:|
+| Sphere | -0.0526 | -0.0492 | **-0.0486** |
+| Sparse Sphere | **-0.0196** | -0.0212 | -0.0243 |
+| Ellipsoid | -0.0404 | **-0.0337** | -0.0360 |
+| Rosenbrock | -148.39 | **-93.12** | -109.33 |
+| Diabetes MLP: training score | -3.93 | **-3.39** | -4.39 |
+
+These are medians over 20 seeds; higher scores are better. No grouped-versus-fixed or grouped-versus-proxy difference remained significant after Holm correction across the 25 comparisons. The grouped policy therefore did not establish a general improvement over the previous AHCO variants at 97D.
+
+To probe the intended high-dimensional use case, we also ran 1,000D Sphere and 10-active-coordinate Sparse Sphere, again with 40 calls and 20 seeds. The table compares medians against methods run on the same tasks and seeds.
+
+| 1,000D task | Adaptive grouped hypothesis | Random | Optuna TPE | Nevergrad OnePlusOne |
+|---|---:|---:|---:|---:|
+| Sphere | **-0.0794** | -0.1146 | -0.1011 | -0.1172 |
+| Sparse Sphere | -0.0308 | -0.0375 | **-0.0260** | -0.0272 |
+
+On Sphere, grouped search scored better than all three baselines after Holm correction across the six comparisons. On sparse Sphere, it beat Random but was not distinguishable from TPE or Nevergrad. Thus the initial 1,000D results are promising for dense objectives but do not yet show that grouped hypotheses reliably identify sparse relevant dimensions. Median AHCO runtime was 0.48 seconds per Sphere run and 0.26 seconds per sparse run on the recorded Windows system; TPE was substantially slower here, while Random and Nevergrad were faster.
+
+The runs, points, trajectories, metadata, source hashes, and summaries are available in [`benchmarks/results/adaptive-grouped-97d-40eval-20seeds/`](./benchmarks/results/adaptive-grouped-97d-40eval-20seeds/) and [`benchmarks/results/adaptive-grouped-1000d-40eval-20seeds/`](./benchmarks/results/adaptive-grouped-1000d-40eval-20seeds/). All 10,400 saved evaluations were audited against the objective definitions and stayed within bounds. These are prototype results, not evidence that the full global space is understood; group-level shared credit can conflate correlated dimensions, and broader task suites and ablations are needed.
+
 # Software design
 
 ## Overview
@@ -88,9 +113,9 @@ The diabetes task is one small fixed-split real-data demonstration, not broad ev
 A run proceeds from a small bootstrap into an evidence-driven sequential loop:
 
 1. **Grouped bootstrap**: up to six points where randomized groups of real coordinates move together.
-2. **Evidence-driven loop**: rank coordinates by observed influence, infer and prune signed pair hypotheses, derive proxy-star hypotheses from two-edge paths, then let a bandit select among available proposal strategies for each next evaluation. Refresh active coordinates when an evaluation improves the best score or a trust-region restart occurs.
+2. **Evidence-driven loop**: estimate coordinate influence and uncertainty over the full space, infer and prune signed pair hypotheses, derive proxy-star hypotheses from two-edge paths, then let a bandit select among six proposal strategies. One strategy samples overlapping groups at several scales and uses a group-specific surrogate to rank star, shared-value, and mixed-value patterns. Refresh active coordinates when an evaluation improves the best score or a trust-region restart occurs.
 
-The total evaluation budget remains a hard cap, but there is no fixed exploration/integration allocation or budget-percentage refresh schedule. The bootstrap only supplies initial observations; all later evaluations are selected sequentially from the evidence available so far. Hypothesis confidence is a heuristic consistency score, not a calibrated probability or proof of a global optimum.
+The total evaluation budget remains a hard cap, but there is no fixed exploration/integration allocation or budget-percentage refresh schedule. The bootstrap only supplies initial observations; all later evaluations are selected sequentially from the evidence available so far. Group memberships are resampled, and per-coordinate evidence balances uniform coverage, observed influence, uncertainty, and prior group successes. A group improvement is shared credit for its changed dimensions, so it is a useful prioritization signal but not a causal attribution. Hypothesis confidence is a heuristic consistency score, not a calibrated probability or proof of a global optimum.
 
 ## Scores, constraints and categorical coordinates
 
@@ -111,7 +136,7 @@ For each bootstrap point AHCO draws a group count $g=\mathrm{clip}(\mathrm{round
 
 Scores are converted to ranks in $[-1,1]$ (ties follow observation order). For a real coordinate with $z_j=2x_j-1$, the effect score is the larger of the absolute correlations of $z_j$ and of $z_j^2-1/3$ with the ranks. For a categorical coordinate it is $\eta=\sqrt{SS_{\mathrm{between}}/SS_{\mathrm{total}}}$ over the rank scores grouped by level. The coordinate score adds (a) the fraction of 24 random half-samples in which the *linear* correlation magnitude (or $\eta$ for categoricals) is at least $0.22$, and (b) normalized split-gain importance from a 35-tree forest on the encoded data, summed over one-hot columns per coordinate. Active coordinates from an earlier selection get a factor $1.15$ at re-selection. The active set has size $m=\min(d,\max(k_{\max},\min(d,3)))$ with $k_{\max}=14$ by default. This heuristic is not an error-controlled stability-selection procedure.
 
-For coordinates left inactive, AHCO also records a guess at a good value: for a real coordinate, the peak of a quadratic regression of the ranks on $z_j$ and $z_j^2-1/3$; for a categorical coordinate, the level with the highest mean rank. The active set is re-estimated after a best-score improvement and at a trust-region restart, retaining a mild preference for previously active coordinates.
+For coordinates left inactive, AHCO also records a guess at a good value: for a real coordinate, the peak of a quadratic regression of the ranks on $z_j$ and $z_j^2-1/3$; for a categorical coordinate, the level with the highest mean rank. The active set is re-estimated after a best-score improvement and at a trust-region restart, retaining a mild preference for previously active coordinates. The group strategy is not limited to this active set: it scores all dimensions and fits a temporary surrogate only on each sampled group.
 
 ## Interaction blocks
 
@@ -134,6 +159,7 @@ Let $\mathrm{TR}$ be the trust-region width, $x_c$ the centre (the best point un
 5. **Proxy-star.** Sample a retained direct or inferred relationship in proportion to its heuristic confidence. Generate 160 candidates that move the endpoints in the inferred same/opposite directions; inferred hypotheses also perturb their mediator. Endpoint step magnitudes are sampled independently so a chained direction does not force equal influence, and the highest UCB-scoring candidate is evaluated.
 
 Block is available only when at least two blocks exist, Inactive only when some coordinate is inactive, and Proxy-star only when at least one relationship hypothesis remains after pruning.
+6. **Adaptive group hypothesis.** Choose a group size uniformly from powers of two up to $\min(d,256)$, plus half-space and full-space groups. Sample dimensions without replacement using a mixture of uniform coverage, full-space univariate evidence, inverse-square-root under-sampling, and a small bonus for past group improvements. Fit a 30-tree surrogate on current observations encoded only on this group. Generate 192 candidates around $x^*$: choose a pivot coordinate and set it to 0, 0.5, or 1; change most other group members either to the pivot value or independently to one of these three values, while holding some members and all out-of-group dimensions fixed. Categorical members may switch to a different level. The group surrogate's UCB selects one candidate. A successful group trial increments success counts for every group member changed from $x^*$; this deliberately cheap shared-credit update does not isolate individual causal effects.
 
 ## Adaptation
 
@@ -144,9 +170,10 @@ The trust region starts at $0.45$, is multiplied by $1.5$ (capped at $0.85$) aft
 | Quantity | Default |
 |---|---|
 | Grouped bootstrap points | $\min(B,6)$ |
+| Group sizes | powers of two through $\min(d,256)$, plus half-space and full-space |
 | Direct relationship filter | $|r|\ge0.15$ and sign stability $\ge0.70$ across 24 half-samples |
 | Proxy-star pruning | confidence $\ge0.20$; chained directions compose by sign multiplication |
-| Candidates per proposal | 600 for UCB; 250 for Block; 160 for Proxy-star; 6 steps for Direction |
+| Candidates per proposal | 600 for UCB; 250 for Block; 192 for grouped hypothesis; 160 for Proxy-star; 6 steps for Direction |
 
 ## Batch and parallel evaluation
 
@@ -163,6 +190,7 @@ AHCO uses a fixed seed and the ChaCha8 generator. For a deterministic objective,
 - Inputs are the unit cube with unordered categorical levels; there are no integer or log-scale types and no noise model.
 - Screening relies on correlations and effect sizes. It can miss non-monotone effects that are not roughly quadratic, purely interactive effects, and (in the stability term) interior optima, which the linear correlation does not capture. Interactions involving categorical coordinates are not detected.
 - The relationship thresholds and strategy settings are heuristics chosen by hand and have not been tuned or ablated; the proxy-star policy has not yet been benchmarked.
+- The grouped strategy's shared credit can confuse correlated dimensions, and its temporary group surrogate can be unreliable with few observations. Parallel objective batches and tests on substantially higher-dimensional problems remain future work.
 - Rank-transformed scores discard magnitude information.
 - Sequential runs apply no penalty against recently evaluated points. Preliminary checks suggest sequential runs can stagnate late in a run, so results should be validated per problem.
 - `Penalty` weights depend on the scale of the objective, and the sentinel $-10^{100}$ assumes ordinary scores exceed it.
